@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+.buildvenv/
+*.exe
+config.json
+.venv/
+.claude/
+# Datos extraídos de la instancia (contienen números de cuenta/IBAN reales)
+fbdi_export/

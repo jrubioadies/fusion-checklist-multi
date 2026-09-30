@@ -1,0 +1,4 @@
+requests>=2.28
+openpyxl>=3.1
+pyinstaller>=6.0
+fusion-client @ git+https://github.com/jrubioadies/fusion-client.git

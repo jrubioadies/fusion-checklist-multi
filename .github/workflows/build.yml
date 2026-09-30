@@ -1,0 +1,49 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: FusionChecklist-windows.exe
+            out: dist/FusionChecklist.exe
+          - os: macos-latest
+            artifact: FusionChecklist-macos
+            out: dist/FusionChecklist
+          - os: ubuntu-latest
+            artifact: FusionChecklist-linux
+            out: dist/FusionChecklist
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Build
+        run: pyinstaller --onefile --name FusionChecklist --paths . --collect-all fusion_client --hidden-import checklist --collect-all openpyxl --clean --noconfirm app.py
+      - name: Rename artifact
+        shell: bash
+        run: cp "${{ matrix.out }}" "${{ matrix.artifact }}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
