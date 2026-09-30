@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Fusion Checklist — Configuration Comparator across Oracle Fusion environments.
+Fusion Checklist (multi-cliente) — Comparador de configuración entre instancias
+Oracle Fusion vía consultas SQL de BI Publisher.
 
-Standalone app that compares configuration item counts across PROD, DEV1,
-DEV2 and TEST environments via BI Publisher SQL queries.
+Cada cliente tiene su perfil (instancias a comparar + usuarios) creado desde el
+asistente de la propia web; las contraseñas van al llavero del sistema.
 
 Usage:  python3 app.py            # serves http://127.0.0.1:8900
-Requires creds in ~/.config/fusion-bip/config.json.
 """
 import json, sys, re, os, shutil, webbrowser, io
 from urllib.parse import urlparse, parse_qs
@@ -15,72 +15,53 @@ from pathlib import Path
 
 from fusion_client import bip as fbip
 import checklist as ckl
+import profiles
 
-CFG = Path.home() / ".config" / "fusion-bip" / "config.json"
 HOST, PORT = "127.0.0.1", 8900
 
-SESSION = {"active": None, "conns": {}}
+# Cliente abierto en esta sesión: perfil + contraseñas en memoria por entorno.
+SESSION = {"client": None, "profile": None, "conns": {}}
 
 
 def cfg():
-    return json.loads(CFG.read_text()) if CFG.exists() else {}
+    """Vista de configuración del cliente activo con la forma que espera el resto
+    del código: {"environments": {nombre: {base, user, pass}}, "sql_report", ...}."""
+    prof = SESSION.get("profile") or {}
+    envs = {}
+    for e in prof.get("environments") or []:
+        conn = SESSION["conns"].get(e["name"]) or {}
+        envs[e["name"]] = {"base": e.get("base", ""), "user": e.get("user", ""), "pass": conn.get("pass", "")}
+    c = {"environments": envs, "datasources": prof.get("datasources") or {}}
+    if prof.get("sql_report"):
+        c["sql_report"] = prof["sql_report"]
+    return c
 
 
-def _persist_login(label, base, user, pw):
-    try:
-        c = json.loads(CFG.read_text()) if CFG.exists() else {}
-        c.setdefault("environments", {})[label] = {"base": base.rstrip("/"), "user": user, "pass": pw}
-        c["default_env"] = label
-        CFG.parent.mkdir(parents=True, exist_ok=True)
-        CFG.write_text(json.dumps(c, indent=2))
-    except Exception:
-        pass
+def compare_envs():
+    """Entornos marcados para comparar, en el orden del perfil."""
+    prof = SESSION.get("profile") or {}
+    return [e["name"] for e in prof.get("environments") or [] if e.get("compare", True)]
 
 
-def load_persisted():
-    c = cfg()
-    envs = c.get("environments") or {}
-    for name, e in envs.items():
-        if e.get("user") and e.get("pass") and e.get("base"):
-            SESSION["conns"][name] = {"base": e["base"].rstrip("/"), "user": e["user"], "pass": e["pass"]}
-    if SESSION["conns"]:
-        SESSION["active"] = c.get("default_env") or next(iter(SESSION["conns"]))
-
-
-def validate_login(base, user, pw):
-    base = (base or "").rstrip("/")
-    if not base or not user or not pw:
-        return (False, "Faltan URL, usuario o contraseña.")
-    body = ("<pub:getFolderContents><pub:folderAbsolutePath>/</pub:folderAbsolutePath>"
-            "</pub:getFolderContents>")
-    envx = ('<soapenv:Envelope xmlns:soapenv="http://www.w3.org/2003/05/soap-envelope" '
-            f'xmlns:pub="{fbip.NS}"><soapenv:Header/><soapenv:Body>{body}'
-            "</soapenv:Body></soapenv:Envelope>")
-    try:
-        r = fbip.requests.post(fbip.endpoint(base), data=envx.encode("utf-8"),
-                               headers={"Content-Type": "application/soap+xml; charset=utf-8"},
-                               auth=(user, pw), timeout=40)
-    except Exception as e:
-        return (False, f"No se pudo conectar con {base}: {e}")
-    if r.status_code == 401:
-        return (False, "Usuario o contraseña incorrectos (401).")
-    if r.status_code >= 400:
-        return (False, f"La instancia respondió HTTP {r.status_code}. ¿URL correcta?")
-    if "getFolderContentsReturn" in r.text or "<absolutePath" in r.text:
-        return (True, "OK")
-    return (False, "Respuesta inesperada del endpoint BI Publisher. ¿URL correcta?")
+def open_client(slug, passwords=None):
+    """Activa un cliente: carga su perfil y las contraseñas (las recibidas o las del
+    llavero). Devuelve la lista de entornos a comparar que siguen sin contraseña."""
+    prof = profiles.load(slug)
+    if not prof:
+        raise RuntimeError(f"No existe el cliente '{slug}'.")
+    passwords = passwords or {}
+    SESSION.update(client=profiles.slugify(slug), profile=prof, conns={})
+    for e in prof.get("environments") or []:
+        pw = passwords.get(e["name"]) or profiles.get_password(slug, e["name"])
+        if pw:
+            SESSION["conns"][e["name"]] = {"base": e["base"].rstrip("/"), "user": e.get("user", ""), "pass": pw}
+    return [n for n in compare_envs() if n not in SESSION["conns"]]
 
 
 def creds(c, env=None):
-    envs = c.get("environments")
-    name = env or SESSION.get("active") or c.get("default_env") or (next(iter(envs)) if envs else "")
-    conn = SESSION["conns"].get(name) or (SESSION["conns"].get(SESSION["active"]) if SESSION.get("active") else None)
-    if conn and conn.get("user"):
-        return (conn.get("base", "").rstrip("/"), conn.get("user", ""), conn.get("pass", ""))
-    if envs:
-        e = envs.get(name) or {}
-        return (e.get("base", "").rstrip("/"), e.get("user", ""), e.get("pass", ""))
-    return (c.get("base", "").rstrip("/"), c.get("user", ""), c.get("pass", ""))
+    name = env or (compare_envs() or [""])[0]
+    e = (c.get("environments") or {}).get(name) or {}
+    return (e.get("base", "").rstrip("/"), e.get("user", ""), e.get("pass", ""))
 
 
 def report_for(c, ds):
@@ -436,7 +417,7 @@ def fbdi_rest_execute(c, spec, source, target):
 # ── HTML page ──────────────────────────────────────────────────────────
 
 PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
-<title>Fusion Checklist — Comparador de Entornos</title>
+<title>Fusion Checklist</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   :root{--bg:#0b0f14;--panel:#0d1117;--border:#22272e;--fg:#e6edf3;--mut:#7d8590;--acc:#1f6feb;--ok:#3fb950;--err:#f85149;--warn:#d29922}
@@ -489,20 +470,29 @@ PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
   .filter-row{padding:8px 16px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)}
   .filter-row label{font-size:11px;color:var(--mut)}
   .filter-row select,.filter-row input{background:#0b0f14;color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:12px}
-  .loginov{display:none;position:fixed;inset:0;background:radial-gradient(1200px 600px at 50% -10%,#16213a,#0b0f14);z-index:300;align-items:center;justify-content:center}
+  .loginov{display:none;position:fixed;inset:0;background:radial-gradient(1200px 600px at 50% -10%,#16213a,#0b0f14);z-index:300;align-items:flex-start;justify-content:center;overflow:auto;padding:5vh 16px}
   .loginov.open{display:flex}
-  .loginbox{width:380px;max-width:92vw;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:26px 26px 20px;box-shadow:0 24px 70px rgba(0,0,0,.6);display:flex;flex-direction:column}
-  .loginbox .lgtitle{font-size:20px;font-weight:800;letter-spacing:.2px}
-  .loginbox .lgsub{color:var(--mut);font-size:12.5px;margin:2px 0 16px}
-  .loginbox label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);margin:9px 0 4px}
-  .loginbox input,.loginbox select{background:#0b0f14;color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:9px 11px;outline:0;font-size:13px}
-  .loginbox input:focus,.loginbox select:focus{border-color:#6e40c9}
-  .loginbox .lgrem{display:flex;flex-direction:row;align-items:center;gap:7px;text-transform:none;letter-spacing:0;font-size:12px;color:var(--fg);margin-top:12px}
-  .loginbox .lgrem input{width:auto}
-  .loginbox #lgBtn{margin-top:16px;background:#6e40c9;color:#fff;border:0;border-radius:8px;padding:11px;font-weight:700;font-size:14px;cursor:pointer}
-  .loginbox #lgBtn:disabled{opacity:.6}
-  .loginbox .lgerr{color:var(--err);font-size:12.5px;margin-top:10px;min-height:16px}
-  .loginbox .lghint{color:var(--mut);font-size:11px;margin-top:12px;line-height:1.5;border-top:1px solid var(--border);padding-top:10px}
+  .wz{width:860px;max-width:100%;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:24px 26px 20px;box-shadow:0 24px 70px rgba(0,0,0,.6)}
+  .wz h2{font-size:20px;margin:0;font-weight:800} .wz .lgsub{color:var(--mut);font-size:12.5px;margin:3px 0 16px}
+  .wz .steps{display:flex;gap:6px;margin:0 0 16px;font-size:11px;color:var(--mut)}
+  .wz .steps span{padding:3px 9px;border:1px solid var(--border);border-radius:99px} .wz .steps span.on{border-color:#6e40c9;color:var(--fg);background:#231a3a}
+  .wz label.f{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);margin:10px 0 4px}
+  .wz input[type=text],.wz input[type=password],.wz select{background:#0b0f14;color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;outline:0;font-size:13px;width:100%}
+  .wz input:focus,.wz select:focus{border-color:#6e40c9}
+  .wz table{width:100%;border-collapse:collapse;margin-top:6px} .wz td,.wz th{padding:5px 4px;vertical-align:top;text-align:left}
+  .wz th{font-size:10.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px;font-weight:600}
+  .wz .st{font-size:11.5px;line-height:1.45;color:var(--mut);max-width:240px} .wz .st.ok{color:var(--ok)} .wz .st.err{color:var(--err)} .wz .st.warn{color:var(--warn)}
+  .wz button{background:#161b22;color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:7px 12px;cursor:pointer;font-size:12.5px;white-space:nowrap}
+  .wz button.pri{background:#6e40c9;border-color:#6e40c9;color:#fff;font-weight:700}
+  .wz button.dan{color:var(--err)} .wz button:disabled{opacity:.55;cursor:default}
+  .wz .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap} .wz .foot{display:flex;gap:8px;margin-top:18px;align-items:center}
+  .wz .foot .sp{flex:1} .wz .lgerr{color:var(--err);font-size:12.5px;margin-top:10px;min-height:16px}
+  .wz .chk{display:flex;gap:7px;align-items:center;font-size:12px;margin-top:10px}
+  .wz .cl{display:flex;gap:10px;align-items:center;border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+  .wz .cl b{font-size:14px} .wz .cl .envs{color:var(--mut);font-size:11.5px;flex:1}
+  .wz .hint{color:var(--mut);font-size:11px;margin-top:14px;line-height:1.5;border-top:1px solid var(--border);padding-top:10px}
+  .wz details{margin-top:12px;font-size:12px;color:var(--mut)}
+  @media (max-width:640px){ .wz table,.wz tbody,.wz tr,.wz td{display:block} .wz thead{display:none} .wz tr{border:1px solid var(--border);border-radius:8px;padding:6px;margin-bottom:8px} }
   /* ── Loader estilo Minecraft (Creeper bailando) ── */
   @keyframes mcdance{0%,100%{transform:rotate(-9deg) translateY(0)}50%{transform:rotate(9deg) translateY(-7px)}}
   .proc{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:26px 20px;text-align:center}
@@ -515,32 +505,17 @@ PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
   .proc.mini .mc::before{box-shadow:none}
   .proc.mini .msg{font-size:12px;font-weight:700}
 </style></head><body>
-<div id="loginOv" class="loginov">
-  <form class="loginbox" id="loginForm" autocomplete="on">
-    <div class="lgtitle">🔐 Fusion Checklist</div>
-    <div class="lgsub">Conéctate a tu instancia de Oracle Fusion</div>
-    <label>Instancia</label>
-    <select id="lgPreset"></select>
-    <input id="lgBase" placeholder="https://tu-instancia.fa.oraclecloud.com" autocomplete="url" spellcheck="false"/>
-    <label>Usuario</label>
-    <input id="lgUser" autocomplete="username" placeholder="usuario de Fusion" spellcheck="false"/>
-    <label>Contraseña</label>
-    <input id="lgPass" type="password" autocomplete="current-password" placeholder="contraseña"/>
-    <label class="lgrem"><input type="checkbox" id="lgRemember"/> Recordar en este equipo</label>
-    <button type="submit" id="lgBtn">Entrar</button>
-    <div class="lgerr" id="lgErr"></div>
-    <div class="lghint">Tus credenciales se usan solo en este equipo para conectar con Fusion; no se envían a ningún servidor externo.</div>
-  </form>
-</div>
+<div id="loginOv" class="loginov"><div class="wz" id="wz"></div></div>
 <header>
   <h1>📋 Fusion Checklist</h1>
-  <span class="sub">Comparador de entornos Oracle Fusion</span>
+  <span class="sub" id="clientName">Comparador de entornos Oracle Fusion</span>
   <span class="sub" id="lgWho" style="color:var(--ok)"></span>
   <div class="actions">
     <span class="progress" id="progress"></span>
     <button id="runAll">▶ Ejecutar comparación</button>
     <button id="exportXlsx" title="Excel con conteos y entidades comparadas entre entornos (respeta los filtros)">⬇ Exportar Excel</button>
-    <button id="logout" class="logout">salir</button>
+    <button id="editClient" class="logout" title="Instancias y usuarios del cliente">⚙ instancias</button>
+    <button id="logout" class="logout">cambiar cliente</button>
   </div>
 </header>
 <div class="filter-row">
@@ -553,7 +528,7 @@ PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
 </div>
 <div class="wrap"><table class="ck" id="tbl"><thead><tr>
   <th>#</th><th>Módulo</th><th>Tarea</th><th>Responsable</th><th>Método</th>
-  <th>PROD</th><th>DEV1</th><th>DEV2</th><th>TEST</th><th>Estado</th>
+  <th id="envHeads" hidden></th><th>Estado</th>
 </tr></thead><tbody id="tbody"></tbody></table></div>
 <div class="detail-modal" id="detailModal">
   <div class="detail-box">
@@ -585,51 +560,193 @@ function showJsErr(msg){
 }
 window.addEventListener('error',function(e){ showJsErr('JS error: '+e.message+'  ('+(e.filename||'').split('/').pop()+':'+e.lineno+')'); });
 window.addEventListener('unhandledrejection',function(e){ showJsErr('Promesa rechazada: '+((e.reason&&(e.reason.stack||e.reason.message))||e.reason)); });
-const ENVS=['PROD','DEV1','DEV2','TEST'];
+let ENVS=[], AUTH={};
 let ITEMS=[], results={};
 const $=s=>document.querySelector(s);
 function getSelectedBU(){ return $('#fBU').value||''; }
 
-// ── login ──
-function showLogin(d){
-  const sel=$('#lgPreset'); sel.innerHTML='';
-  (d.presets||[]).forEach(p=>{const o=document.createElement('option');o.value=p.base;o.textContent=p.label+'  ·  '+p.base.replace('https://','');sel.appendChild(o);});
-  const om=document.createElement('option'); om.value=''; om.textContent='Otra instancia (URL manual)…'; sel.appendChild(om);
-  const applyPreset=()=>{ $('#lgBase').value=sel.value; $('#lgBase').style.display=sel.value?'none':'block'; };
-  sel.onchange=applyPreset; applyPreset();
-  if(!(d.presets||[]).length){ sel.style.display='none'; $('#lgBase').style.display='block'; }
-  $('#loginOv').classList.add('open'); setTimeout(()=>$((d.presets||[]).length?'#lgUser':'#lgBase').focus(),100);
+// ── asistente de cliente: 1) instancias 2) usuarios y contraseñas ──
+const escH=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const post=(url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json());
+let WZ=null;  // {slug, name, environments:[{name,base,user,compare,has_password,pass,probe,test}], sql_report, fbdi_source, fbdi_target}
+
+function wzOpen(){ $('#loginOv').classList.add('open'); }
+function wzSteps(n){ return '<div class="steps">'+['Cliente','1 · Instancias','2 · Usuarios y contraseñas'].map((t,i)=>'<span class="'+(i===n?'on':'')+'">'+t+'</span>').join('')+'</div>'; }
+
+function wzClients(){
+  const cs=AUTH.clients||[];
+  $('#wz').innerHTML='<h2>🔐 Fusion Checklist</h2><div class="lgsub">Elige el cliente o da de alta uno nuevo con sus instancias Oracle Fusion.</div>'+wzSteps(0)+
+    (cs.length?cs.map(c=>'<div class="cl"><b>'+escH(c.name)+'</b><span class="envs">'+escH((c.environments||[]).join(' · '))+'</span>'+
+      '<button class="pri" data-open="'+escH(c.slug)+'">Abrir</button><button data-edit="'+escH(c.slug)+'">Editar</button><button class="dan" data-del="'+escH(c.slug)+'">✕</button></div>').join('')
+      :'<div class="st">Todavía no hay clientes configurados.</div>')+
+    '<div class="foot"><button class="pri" id="wzNew">+ Nuevo cliente</button><span class="sp"></span></div><div class="lgerr" id="wzErr"></div>'+
+    '<div class="hint">Los perfiles se guardan en <code>~/.config/fusion-checklist/clients/</code>; las contraseñas '+(AUTH.keyring?'en el llavero del sistema.':'<b>solo en memoria</b> (instala <code>keyring</code> para recordarlas).')+'</div>';
+  $('#wzNew').onclick=()=>{ WZ={slug:'',name:'',sql_report:'',environments:[newEnv('PROD'),newEnv('TEST')]}; wzInstances(); };
+  $('#wz').querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>openClient(b.dataset.open));
+  $('#wz').querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>editClient(b.dataset.edit,1));
+  $('#wz').querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
+    if(b.dataset.confirm!=='1'){ b.dataset.confirm='1'; b.textContent='¿Eliminar?'; return; }
+    await post('/api/clients/delete',{slug:b.dataset.del}); await refreshAuth(); wzClients();
+  });
+  wzOpen();
+}
+function newEnv(name){ return {name:name||'',base:'',user:'',compare:true,pass:'',has_password:false}; }
+
+async function editClient(slug,step){
+  const d=await fetch('/api/clients/get?slug='+encodeURIComponent(slug)).then(r=>r.json());
+  if(d.error){ $('#wzErr').textContent='⚠ '+d.error; return; }
+  WZ=d; WZ.environments.forEach(e=>{ e.pass=''; if(e.compare===undefined) e.compare=true; });
+  step===2?wzCreds():wzInstances(); wzOpen();
+}
+async function openClient(slug){
+  const d=await post('/api/clients/open',{slug});
+  if(d.error){ $('#wzErr').textContent='⚠ '+d.error; return; }
+  if(d.missing&&d.missing.length) return editClient(slug,2);  // faltan contraseñas → paso 2
+  enterApp();
+}
+
+// Paso 1: instancias que se van a comparar
+function wzInstances(){
+  const E=WZ.environments;
+  const rows=E.map((e,i)=>{
+    const p=e.probe, st=!p?'<span class="st">sin evaluar</span>':p.loading?'<span class="st">evaluando…</span>':
+      '<span class="st '+(p.ok?'ok':'err')+'">'+(p.ok?'✓ ':'⚠ ')+escH(p.message)+(p.latency_ms!=null?' · '+p.latency_ms+' ms':'')+'</span>';
+    return '<tr><td style="width:110px"><input type="text" data-k="name" data-i="'+i+'" value="'+escH(e.name)+'" placeholder="PROD"/></td>'+
+      '<td><input type="text" data-k="base" data-i="'+i+'" value="'+escH(e.base)+'" placeholder="https://xxxx.fa.em2.oraclecloud.com" spellcheck="false"/></td>'+
+      '<td style="text-align:center"><input type="checkbox" data-k="compare" data-i="'+i+'" '+(e.compare?'checked':'')+' title="Incluir en la comparación"/></td>'+
+      '<td><button data-probe="'+i+'">Evaluar</button></td><td>'+st+'</td>'+
+      '<td><button class="dan" data-rm="'+i+'" title="Quitar">✕</button></td></tr>';
+  }).join('');
+  const envOpts=sel=>E.filter(e=>e.name).map(e=>'<option'+(e.name===sel?' selected':'')+'>'+escH(e.name)+'</option>').join('');
+  $('#wz').innerHTML='<h2>'+(WZ.slug?'Editar cliente':'Nuevo cliente')+'</h2><div class="lgsub">Indica las instancias del cliente y cuáles quieres comparar. «Evaluar» comprueba que la URL es una instancia Fusion accesible (sin credenciales).</div>'+wzSteps(1)+
+    '<label class="f">Nombre del cliente</label><input type="text" id="wzName" value="'+escH(WZ.name)+'" placeholder="p. ej. Acme S.A." '+(WZ.slug?'disabled':'')+'/>'+
+    '<label class="f">Instancias</label><table><thead><tr><th>Nombre</th><th>URL</th><th>Comparar</th><th></th><th>Estado</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'+
+    '<div class="row" style="margin-top:8px"><button id="wzAdd">+ Añadir instancia</button><button id="wzProbeAll">Evaluar todas</button></div>'+
+    '<details><summary>Opciones avanzadas</summary>'+
+      '<label class="f">Report ejecutor SQL (BI Publisher)</label><input type="text" id="wzReport" value="'+escH(WZ.sql_report||'')+'" placeholder="/Custom/SQLTools/SQLConReport.xdo"/>'+
+      '<div class="row" style="margin-top:6px"><label class="f" style="margin:0">Origen FBDI por defecto <select id="wzSrc">'+envOpts(WZ.fbdi_source||(E[0]||{}).name)+'</select></label>'+
+      '<label class="f" style="margin:0">Destino <select id="wzTgt">'+envOpts(WZ.fbdi_target||(E[E.length-1]||{}).name)+'</select></label></div></details>'+
+    '<div class="foot"><button id="wzBack">← Clientes</button><span class="sp"></span><button class="pri" id="wzNext">Siguiente: usuarios →</button></div><div class="lgerr" id="wzErr"></div>';
+  const W=$('#wz');
+  W.querySelectorAll('input[data-k]').forEach(inp=>inp.oninput=inp.onchange=()=>{
+    const e=E[+inp.dataset.i], k=inp.dataset.k;
+    if(k==='compare') e.compare=inp.checked; else { e[k]=k==='name'?inp.value.toUpperCase():inp.value; if(k==='base') e.probe=null; }
+    if(k==='name') inp.value=e.name;
+  });
+  $('#wzName').oninput=ev=>WZ.name=ev.target.value;
+  $('#wzReport').oninput=ev=>WZ.sql_report=ev.target.value.trim();
+  $('#wzSrc').onchange=ev=>WZ.fbdi_source=ev.target.value; $('#wzTgt').onchange=ev=>WZ.fbdi_target=ev.target.value;
+  $('#wzAdd').onclick=()=>{ E.push(newEnv('')); wzInstances(); };
+  W.querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{ E.splice(+b.dataset.rm,1); wzInstances(); });
+  W.querySelectorAll('[data-probe]').forEach(b=>b.onclick=()=>probeEnv(+b.dataset.probe));
+  $('#wzProbeAll').onclick=()=>E.forEach((_,i)=>probeEnv(i));
+  $('#wzBack').onclick=async()=>{ await refreshAuth(); wzClients(); };
+  $('#wzNext').onclick=()=>{
+    const err=validateInstances(); if(err){ $('#wzErr').textContent='⚠ '+err; return; }
+    wzCreds();
+  };
+}
+async function probeEnv(i){
+  const e=WZ.environments[i]; if(!e.base.trim()){ e.probe={ok:false,message:'Falta la URL'}; return wzInstances(); }
+  e.probe={loading:true}; wzInstances();
+  try{
+    const d=await post('/api/setup/probe',{base:e.base});
+    e.probe=d; if(d.base) e.base=d.base;
+    if(!e.name && d.suggested_name && !WZ.environments.some(x=>x.name===d.suggested_name)) e.name=d.suggested_name;
+  }catch(ex){ e.probe={ok:false,message:String(ex)}; }
+  wzInstances();
+}
+function validateInstances(){
+  const E=WZ.environments;
+  if(!(WZ.name||'').trim()) return 'Pon un nombre al cliente.';
+  if(E.some(e=>!e.name.trim()||!e.base.trim())) return 'Cada instancia necesita nombre y URL.';
+  if(new Set(E.map(e=>e.name)).size!==E.length) return 'Los nombres de instancia deben ser únicos.';
+  if(E.filter(e=>e.compare).length<2) return 'Marca al menos dos instancias para comparar.';
+  return '';
+}
+
+// Paso 2: usuario y contraseña de cada instancia
+function wzCreds(){
+  const E=WZ.environments;
+  const rows=E.map((e,i)=>{
+    const t=e.test; let st='<span class="st">'+(e.has_password?'contraseña guardada':'sin probar')+'</span>';
+    if(t&&t.loading) st='<span class="st">probando…</span>';
+    else if(t&&!t.ok) st='<span class="st err">⚠ '+escH(t.message)+'</span>';
+    else if(t&&t.ok){
+      const q=t.sql||{};
+      st='<span class="st ok">✓ login correcto</span><br>'+(q.ok?'<span class="st ok">✓ SQL: '+escH(q.ledgers)+' ledgers · '+escH(q.bus)+' BUs · '+escH(q.legal_entities)+' LEs</span>'
+        :'<span class="st warn">⚠ SQL: '+escH(q.message||'no disponible')+'</span>');
+    }
+    return '<tr><td style="width:120px"><b>'+escH(e.name)+'</b>'+(e.compare?'':' <span class="st">(no compara)</span>')+'<div class="st">'+escH(e.base.replace(/^https?:\/\//,''))+'</div></td>'+
+      '<td><input type="text" data-k="user" data-i="'+i+'" value="'+escH(e.user)+'" placeholder="usuario" autocomplete="off" spellcheck="false"/></td>'+
+      '<td><input type="password" data-k="pass" data-i="'+i+'" value="'+escH(e.pass)+'" placeholder="'+(e.has_password?'•••••• (sin cambios)':'contraseña')+'" autocomplete="new-password"/></td>'+
+      '<td><button data-test="'+i+'">Probar</button></td><td>'+st+'</td></tr>';
+  }).join('');
+  $('#wz').innerHTML='<h2>'+escH(WZ.name)+'</h2><div class="lgsub">Usuario y contraseña de Fusion para cada instancia. «Probar» valida el login y que el report ejecutor de SQL está desplegado.</div>'+wzSteps(2)+
+    '<table><thead><tr><th>Instancia</th><th>Usuario</th><th>Contraseña</th><th></th><th>Resultado</th></tr></thead><tbody>'+rows+'</tbody></table>'+
+    '<div class="row" style="margin-top:8px"><button id="wzSame">Usar el primer usuario/contraseña en todas</button><button id="wzTestAll">Probar todas</button></div>'+
+    '<label class="chk"><input type="checkbox" id="wzRemember" '+(AUTH.keyring?'checked':'disabled')+'/> Guardar contraseñas en el llavero del sistema'+(AUTH.keyring?'':' (no disponible)')+'</label>'+
+    '<div class="foot"><button id="wzBack">← Instancias</button><span class="sp"></span><button class="pri" id="wzSave">Guardar y abrir</button></div><div class="lgerr" id="wzErr"></div>'+
+    '<div class="hint">Las credenciales solo se usan en este equipo para conectar con Fusion; no se envían a ningún servidor externo.</div>';
+  const W=$('#wz');
+  W.querySelectorAll('input[data-k]').forEach(inp=>inp.oninput=()=>{ const e=E[+inp.dataset.i]; e[inp.dataset.k]=inp.value; e.test=null; });
+  W.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>testEnv(+b.dataset.test));
+  $('#wzTestAll').onclick=()=>E.forEach((_,i)=>testEnv(i));
+  $('#wzSame').onclick=()=>{ const f=E[0]; E.forEach(e=>{ e.user=f.user; if(f.pass) e.pass=f.pass; e.test=null; }); wzCreds(); };
+  $('#wzBack').onclick=wzInstances;
+  $('#wzSave').onclick=saveClient;
+}
+async function testEnv(i){
+  const e=WZ.environments[i];
+  if(!e.user.trim()||(!e.pass&&!e.has_password)){ e.test={ok:false,message:'Falta usuario o contraseña'}; return wzCreds(); }
+  e.test={loading:true}; wzCreds();
+  try{ e.test=await post('/api/setup/test',{base:e.base,user:e.user,pass:e.pass,slug:WZ.slug,env:e.name,sql_report:WZ.sql_report}); }
+  catch(ex){ e.test={ok:false,message:String(ex)}; }
+  wzCreds();
+}
+async function saveClient(){
+  const E=WZ.environments, btn=$('#wzSave');
+  const miss=E.filter(e=>e.compare&&(!e.user.trim()||(!e.pass&&!e.has_password))).map(e=>e.name);
+  if(miss.length){ $('#wzErr').textContent='⚠ Falta usuario o contraseña en: '+miss.join(', '); return; }
+  btn.disabled=true; btn.textContent='Guardando…';
+  const profile={slug:WZ.slug,name:WZ.name.trim(),sql_report:WZ.sql_report||undefined,
+    fbdi_source:WZ.fbdi_source,fbdi_target:WZ.fbdi_target,
+    environments:E.map(e=>({name:e.name,base:e.base,user:e.user.trim(),compare:!!e.compare}))};
+  const passwords={}; E.forEach(e=>{ if(e.pass) passwords[e.name]=e.pass; });
+  try{
+    const d=await post('/api/clients/save',{profile,passwords,remember:$('#wzRemember').checked});
+    if(!d.ok){ $('#wzErr').textContent='⚠ '+(d.error||'Error'); return; }
+    if(d.missing&&d.missing.length){ $('#wzErr').textContent='⚠ Sin contraseña para: '+d.missing.join(', '); return; }
+    location.reload();
+  }catch(ex){ $('#wzErr').textContent='⚠ '+ex; }
+  finally{ btn.disabled=false; btn.textContent='Guardar y abrir'; }
+}
+
+async function refreshAuth(){ AUTH=await fetch('/api/auth').then(r=>r.json()); return AUTH; }
+function enterApp(){ location.reload(); }
+function renderEnvHeads(){
+  const h=$('#envHeads'); h.insertAdjacentHTML('beforebegin',ENVS.map(e=>'<th>'+escH(e)+'</th>').join('')); h.remove();
 }
 async function checkAuth(){
-  try{
-    const d=await fetch('/api/auth').then(r=>r.json());
-    if(d.logged_in){ $('#loginOv').classList.remove('open'); $('#lgWho').textContent='🔒 '+d.user; loadItems(); loadBUs(); }
-    else showLogin(d);
-  }catch(e){ showLogin({presets:[]}); }
+  try{ await refreshAuth(); }catch(e){ AUTH={clients:[]}; }
+  if(AUTH.logged_in){
+    ENVS=AUTH.envs; renderEnvHeads();
+    $('#loginOv').classList.remove('open');
+    $('#clientName').textContent='🏢 '+AUTH.client.name+' · '+ENVS.join(' / ');
+    $('#lgWho').textContent='🔒 '+(AUTH.users||[]).join(', ');
+    loadItems();
+  } else if(AUTH.client){ editClient(AUTH.client.slug,2); }
+  else wzClients();
 }
-$('#loginForm').addEventListener('submit',async e=>{
-  e.preventDefault();
-  const btn=$('#lgBtn'), err=$('#lgErr'); err.textContent='';
-  const base=($('#lgPreset').value||$('#lgBase').value).trim();
-  const user=$('#lgUser').value.trim(), pw=$('#lgPass').value;
-  if(!base||!user||!pw){ err.textContent='⚠ Rellena todos los campos'; return; }
-  btn.disabled=true; btn.textContent='Conectando… ⛏️';
-  try{
-    const d=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({base,user,pass:pw,remember:$('#lgRemember').checked})}).then(r=>r.json());
-    if(!d.ok){ err.textContent='⚠ '+(d.error||'Error'); return; }
-    $('#loginOv').classList.remove('open'); $('#lgWho').textContent='🔒 '+user; loadItems();
-  }catch(ex){ err.textContent='⚠ '+ex; }
-  finally{ btn.disabled=false; btn.textContent='Entrar'; }
-});
 $('#logout').onclick=async()=>{ await fetch('/api/logout',{method:'POST'}); location.reload(); };
+$('#editClient').onclick=()=>AUTH.client&&editClient(AUTH.client.slug,1);
 
 // ── checklist ──
 async function loadBUs(){
   const btn=$('#loadBU'), sel=$('#fBU'), st=$('#buStatus');
   btn.disabled=true; btn.textContent='cargando…'; if(st) st.textContent='⏳ cargando…';
   try{
-    const r=await fetch('/api/checklist/bus',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({env:'PROD'})});
+    const r=await fetch('/api/checklist/bus',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({env:ENVS[0]})});
     const d=await r.json();
     sel.innerHTML='<option value="">(todas)</option>';
     if(d.error){ if(st) st.textContent='⚠ '+d.error; }
@@ -776,7 +893,7 @@ async function showDiff(step){
   $('#detTtl').textContent='Comparación: '+item.task;
   $('#detEnv').textContent='TODOS';
   $('#detInfo').textContent='Cargando…';
-  $('#detBody').innerHTML=proc('Obteniendo detalle de los 4 entornos…');
+  $('#detBody').innerHTML=proc('Obteniendo detalle de los '+ENVS.length+' entornos…');
   $('#detailModal').classList.add('open');
   const allData={};
   await Promise.all(ENVS.map(async env=>{
@@ -849,7 +966,7 @@ function openFbdi(step){
   fbdiStep=step;
   const it=ITEMS.find(i=>i.step===step);
   $('#fbdiTtl').textContent='📥 FBDI · '+(it?it.task:('paso '+step));
-  fillEnvSelect($('#fbdiSrc'),'PROD'); fillEnvSelect($('#fbdiTgt'),'TEST');
+  fillEnvSelect($('#fbdiSrc'),AUTH.fbdi_source||ENVS[0]); fillEnvSelect($('#fbdiTgt'),AUTH.fbdi_target||ENVS[ENVS.length-1]);
   $('#fbdiInfo').textContent='';
   const canRest=!!(it&&it.fbdi_rest), canBI=!!(it&&it.fbdi_bi);
   $('#fbdiCalc').style.display=canBI?'':'none';
@@ -988,7 +1105,6 @@ checkAuth();
 # ── Ejecución de items del checklist + export Excel ─────────────────────
 
 CHECKLIST_DS = "FSCM (Financials/SCM)"
-EXPORT_ENVS = ["PROD", "DEV1", "DEV2", "TEST"]
 
 
 def checklist_query(c, item, env, mode, bu_id=None):
@@ -1138,18 +1254,31 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, PAGE, "text/html; charset=utf-8")
 
         if u.path == "/api/auth":
-            c = cfg()
-            envs = c.get("environments") or {}
-            presets = [{"label": n, "base": e.get("base", "")} for n, e in envs.items() if e.get("base")]
-            logged_in = bool(SESSION.get("conns"))
-            user = ""
-            if logged_in:
-                conn = SESSION["conns"].get(SESSION.get("active", "")) or next(iter(SESSION["conns"].values()), {})
-                user = conn.get("user", "")
-            return self._send(200, json.dumps({
-                "logged_in": logged_in,
-                "user": user,
-                "presets": presets}))
+            prof = SESSION.get("profile")
+            envs = compare_envs()
+            missing = [n for n in envs if n not in SESSION["conns"]]
+            payload = {"keyring": profiles.keyring_available(), "clients": profiles.list_clients(),
+                       "client": None, "logged_in": False}
+            if prof:
+                env_list = prof.get("environments") or []
+                payload.update({
+                    "client": {"slug": SESSION["client"], "name": prof.get("name") or SESSION["client"]},
+                    "envs": envs, "missing": missing,
+                    "logged_in": bool(envs) and not missing,
+                    "users": sorted({e.get("user", "") for e in env_list if e.get("name") in envs}),
+                    "fbdi_source": prof.get("fbdi_source") or (envs[0] if envs else ""),
+                    "fbdi_target": prof.get("fbdi_target") or (envs[-1] if envs else "")})
+            return self._send(200, json.dumps(payload))
+
+        if u.path == "/api/clients/get":
+            slug = (parse_qs(u.query).get("slug") or [""])[0]
+            prof = profiles.load(slug)
+            if not prof:
+                return self._send(404, json.dumps({"error": f"No existe el cliente '{slug}'."}))
+            for e in prof.get("environments") or []:
+                e["has_password"] = bool(profiles.get_password(slug, e["name"]))
+            prof["slug"] = profiles.slugify(slug)
+            return self._send(200, json.dumps(prof))
 
         if u.path == "/api/checklist/items":
             items = []
@@ -1171,41 +1300,61 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
 
-        if u.path == "/api/login":
+        if u.path.startswith(("/api/setup/", "/api/clients/")) or u.path == "/api/logout":
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 req = json.loads(self.rfile.read(n) or b"{}")
-                base = (req.get("base") or "").strip().rstrip("/")
-                user = (req.get("user") or "").strip()
-                pw = req.get("pass") or ""
-                ok, msg = validate_login(base, user, pw)
-                if not ok:
-                    return self._send(200, json.dumps({"ok": False, "error": msg}))
-                # Reuse an existing preset name if the URL already matches one,
-                # so logging in doesn't create a duplicate environment.
-                existing = cfg().get("environments") or {}
-                label = next((n for n, e in existing.items()
-                              if (e.get("base") or "").rstrip("/") == base), None)
-                if not label:
-                    label = base.split("//")[-1].split(".")[0].upper() if base else "ENV"
-                SESSION["conns"][label] = {"base": base, "user": user, "pass": pw}
-                SESSION["active"] = label
-                if req.get("remember"):
-                    _persist_login(label, base, user, pw)
-                return self._send(200, json.dumps({"ok": True, "label": label}))
+                if u.path == "/api/setup/probe":
+                    return self._send(200, json.dumps(profiles.probe(req.get("base"))))
+                if u.path == "/api/setup/test":
+                    base = profiles.normalize_base(req.get("base"))
+                    user, pw = (req.get("user") or "").strip(), req.get("pass") or ""
+                    if not pw and req.get("slug") and req.get("env"):  # contraseña ya guardada
+                        pw = profiles.get_password(req["slug"], req["env"]) or ""
+                    ok, msg = profiles.check_login(base, user, pw)
+                    out = {"ok": ok, "message": msg}
+                    if ok:
+                        out["sql"] = profiles.check_sql(base, user, pw, req.get("sql_report") or None)
+                    return self._send(200, json.dumps(out))
+                if u.path == "/api/clients/save":
+                    prof = req.get("profile") or {}
+                    envs = prof.get("environments") or []
+                    if not (prof.get("name") or "").strip():
+                        return self._send(200, json.dumps({"ok": False, "error": "Falta el nombre del cliente."}))
+                    names = [(e.get("name") or "").strip().upper() for e in envs]
+                    if not envs or any(not x for x in names) or len(set(names)) != len(names):
+                        return self._send(200, json.dumps({"ok": False, "error": "Cada instancia necesita un nombre único."}))
+                    for e, nm in zip(envs, names):
+                        e["name"], e["base"] = nm, profiles.normalize_base(e.get("base"))
+                        if not e["base"]:
+                            return self._send(200, json.dumps({"ok": False, "error": f"La instancia {nm} no tiene URL."}))
+                    if len([e for e in envs if e.get("compare", True)]) < 2:
+                        return self._send(200, json.dumps({"ok": False, "error": "Marca al menos dos instancias para comparar."}))
+                    passwords = {(k or "").upper(): v for k, v in (req.get("passwords") or {}).items() if v}
+                    remember = bool(req.get("remember")) and profiles.keyring_available()
+                    slug = profiles.save(prof, passwords if remember else None)
+                    missing = open_client(slug, passwords)
+                    return self._send(200, json.dumps({"ok": True, "slug": slug, "missing": missing}))
+                if u.path == "/api/clients/open":
+                    missing = open_client(req.get("slug") or "", req.get("passwords") or {})
+                    return self._send(200, json.dumps({"ok": not missing, "missing": missing}))
+                if u.path == "/api/clients/delete":
+                    profiles.delete(req.get("slug") or "")
+                    if SESSION.get("client") == profiles.slugify(req.get("slug") or ""):
+                        SESSION.update(client=None, profile=None, conns={})
+                    return self._send(200, json.dumps({"ok": True}))
+                if u.path == "/api/logout":
+                    SESSION.update(client=None, profile=None, conns={})
+                    return self._send(200, json.dumps({"ok": True}))
+                return self._send(404, json.dumps({"error": "not found"}))
             except Exception as e:
                 return self._send(200, json.dumps({"ok": False, "error": str(e)}))
-
-        if u.path == "/api/logout":
-            SESSION["conns"].clear()
-            SESSION["active"] = None
-            return self._send(200, json.dumps({"ok": True}))
 
         if u.path == "/api/checklist/bus":
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 req = json.loads(self.rfile.read(n) or b"{}")
-                env = req.get("env", "PROD")
+                env = req.get("env") or (compare_envs() or [""])[0]
                 c = cfg()
                 ds = "FSCM (Financials/SCM)"
                 base, user, pw = creds(c, env)
@@ -1251,8 +1400,9 @@ class H(BaseHTTPRequestHandler):
                 items = [it for it in ckl.CHECKLIST if not steps or it["step"] in steps]
                 if not items:
                     return self._send(200, json.dumps({"error": "No hay tareas que exportar."}))
-                data = checklist_collect(cfg(), items, EXPORT_ENVS, bu_id)
-                raw = checklist_build_xlsx(items, EXPORT_ENVS, data, bu_id)
+                envs = compare_envs()
+                data = checklist_collect(cfg(), items, envs, bu_id)
+                raw = checklist_build_xlsx(items, envs, data, bu_id)
                 fname = "Fusion_Checklist" + (f"_BU{bu_id}" if bu_id else "") + ".xlsx"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1331,10 +1481,11 @@ class H(BaseHTTPRequestHandler):
 # ── main ───────────────────────────────────────────────────────────────
 
 def main():
-    load_persisted()
     srv = ThreadingHTTPServer((HOST, PORT), H)
     url = f"http://{HOST}:{PORT}"
-    print(f"Fusion Checklist escuchando en {url}")
+    print(f"Fusion Checklist (multi-cliente) escuchando en {url}")
+    if not profiles.keyring_available():
+        print("⚠ 'keyring' no disponible: las contraseñas solo se guardarán durante la sesión.")
     try:
         webbrowser.open(url)
     except Exception:

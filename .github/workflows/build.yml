@@ -33,7 +33,7 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
       - name: Build
-        run: pyinstaller --onefile --name FusionChecklist --paths . --collect-all fusion_client --hidden-import checklist --collect-all openpyxl --clean --noconfirm app.py
+        run: pyinstaller --onefile --name FusionChecklist --paths . --collect-all fusion_client --hidden-import checklist --hidden-import profiles --collect-all keyring --collect-all openpyxl --clean --noconfirm app.py
       - name: Rename artifact
         shell: bash
         run: cp "${{ matrix.out }}" "${{ matrix.artifact }}"

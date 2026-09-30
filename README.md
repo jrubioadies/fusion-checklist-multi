@@ -1,49 +1,51 @@
-# Fusion Checklist — Configuration Comparator
+# Fusion Checklist (multi-cliente)
 
-Compares Oracle Fusion Cloud configuration across environments (PROD, DEV1, DEV2, TEST).
+Compara la configuración de Oracle Fusion Cloud entre las instancias de **cualquier cliente**
+(PROD, TEST, DEV…, tantas como tenga) vía consultas SQL de BI Publisher.
 
-39 checklist items covering GL, AP, AR, Fixed Assets, Cash Management, Procurement and Intercompany — each with a SQL query that counts entities via BI Publisher.
+Evolución genérica de [`fusion-checklist`](https://github.com/jrubioadies/fusion-checklist),
+que estaba fijada a 4 entornos de un único cliente.
 
-## Features
+## Flujo
 
-- **Multi-environment comparison** — Run all 39 items against 4 environments in parallel
-- **Detail view** — Click any count to see the actual records
-- **Diff view** — Click "diferencias" to see which records exist in which environments
-- **Business Unit filter** — Filter by BU across all items
-- **Module/method filters** — Filter by GL, AP, AR, etc. and by config method (REST, FBDI, UI)
+Al abrir la app aparece un asistente:
 
-## Quick start
+1. **Cliente** — elige un cliente guardado o crea uno nuevo.
+2. **Instancias** — añade las instancias del cliente (nombre + URL) y marca cuáles comparar.
+   «Evaluar» comprueba, sin credenciales, que la URL es una instancia Fusion con BI Publisher
+   accesible, normaliza la URL y sugiere el nombre (`xxx-dev1.fa…` → `DEV1`).
+3. **Usuarios y contraseñas** — usuario/contraseña por instancia. «Probar» valida el login y que
+   el report ejecutor de SQL está desplegado, mostrando nº de ledgers, BUs y entidades legales.
+
+Después, el comparador ejecuta los 39 items del checklist (GL, AP, AR, FA, CM, Compras,
+Intercompany) contra las instancias marcadas, con vista de detalle, diferencias, filtro por BU,
+export a Excel y delta FBDI/REST entre dos instancias.
+
+## Arranque
 
 ```bash
 pip install -r requirements.txt
-python app.py
+python app.py        # http://127.0.0.1:8900
 ```
 
-> `requirements.txt` pulls in [`fusion-client`](https://github.com/jrubioadies/fusion-client)
-> (the shared BI Publisher SOAP engine) straight from git, so `pip install requests`
-> on its own is no longer enough.
+## Dónde se guarda cada cosa
 
-Opens http://127.0.0.1:8900 — log in with your Oracle Fusion credentials.
+| Qué | Dónde |
+|---|---|
+| Perfil del cliente (instancias, usuarios, report SQL, origen/destino FBDI) | `~/.config/fusion-checklist/clients/<cliente>.json` (chmod 600) |
+| Contraseñas | Llavero del sistema vía `keyring` (servicio `fusion-checklist`, cuenta `<cliente>/<instancia>`) |
 
-## Build executable
+Si `keyring` no está disponible las contraseñas solo se mantienen en memoria durante la sesión.
+
+## Requisito en cada instancia
+
+Las consultas se ejecutan mediante el report `/Custom/SQLTools/SQLConReport.xdo` sobre el data
+model `SQLConDM`. Si «Probar» indica que no existe, hay que desplegarlo en esa instancia
+(`fusion-client setup`) o indicar otra ruta en *Opciones avanzadas* del paso 1.
+
+## Build ejecutable
 
 ```bash
-# Linux/macOS
-bash build.sh
-
-# Windows
-build.bat
-```
-
-## Configuration
-
-Uses the same config file as Fusion Data Studio: `~/.config/fusion-bip/config.json`
-
-```json
-{
-  "environments": {
-    "PROD": { "base": "https://xxx-fa-ext.oraclecloud.com", "user": "...", "pass": "..." },
-    "DEV1": { "base": "...", "user": "...", "pass": "..." }
-  }
-}
+bash build.sh      # Linux/macOS
+build.bat          # Windows
 ```
