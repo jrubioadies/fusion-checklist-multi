@@ -445,6 +445,9 @@ PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
   .badge-method{font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;white-space:nowrap}
   .badge-method.rest{background:#1a4b2e;color:#3fb950} .badge-method.fbdi{background:#2d1f0e;color:#d29922}
   .badge-method.rest-fbdi{background:#0c2d4a;color:#58a6ff} .badge-method.ui{background:#1c1c1c;color:#7d8590}
+  .badge-method.sql{background:#1a2d4a;color:#79c0ff} .badge-method.perfil{background:#2a1f3d;color:#d2a8ff} .badge-method.lookup{background:#2d2a0e;color:#e3b341}
+  table.ck .cnt.na{color:var(--mut);font-weight:400;font-size:10.5px;cursor:default}
+  .mand{color:var(--warn);font-weight:800;margin-left:4px;cursor:help}
   .diff{font-size:10px;color:var(--warn);margin-left:4px}
   .fbdi-btn{background:#0c2d4a;border:1px solid #1f6feb;color:#58a6ff;border-radius:5px;padding:1px 5px;font-size:11px;cursor:pointer;margin-left:5px}
   .fbdi-btn:hover{background:#123a5e}
@@ -519,8 +522,9 @@ PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
   </div>
 </header>
 <div class="filter-row">
+  <label>Checklist <select id="fCl"></select></label>
   <label>Módulo <select id="fMod"><option value="">Todos</option></select></label>
-  <label>Método <select id="fMethod"><option value="">Todos</option><option value="REST">REST</option><option value="FBDI">FBDI</option><option value="REST+FBDI">REST+FBDI</option><option value="UI">UI</option></select></label>
+  <label>Método <select id="fMethod"><option value="">Todos</option></select></label>
   <label>Business Unit <select id="fBU"><option value="">(todas)</option></select></label>
   <label>Buscar <input id="fSearch" placeholder="filtrar tarea…" style="min-width:200px"/></label>
   <button id="loadBU" style="background:#161b22;color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:11px">↻ Cargar BUs</button>
@@ -560,7 +564,8 @@ function showJsErr(msg){
 }
 window.addEventListener('error',function(e){ showJsErr('JS error: '+e.message+'  ('+(e.filename||'').split('/').pop()+':'+e.lineno+')'); });
 window.addEventListener('unhandledrejection',function(e){ showJsErr('Promesa rechazada: '+((e.reason&&(e.reason.stack||e.reason.message))||e.reason)); });
-let ENVS=[], AUTH={};
+let ENVS=[], AUTH={}, CL='financials';
+const store={get:k=>{try{return localStorage.getItem(k);}catch(e){return null;}},set:(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}}};
 let ITEMS=[], results={};
 const $=s=>document.querySelector(s);
 function getSelectedBU(){ return $('#fBU').value||''; }
@@ -758,11 +763,26 @@ async function loadBUs(){
   btn.disabled=false; btn.textContent='↻ Cargar BUs';
 }
 
+async function loadChecklists(){
+  const d=await fetch('/api/checklist/list').then(r=>r.json());
+  const sel=$('#fCl'); sel.innerHTML='';
+  (d.checklists||[]).forEach(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name+' ('+c.count+')';
+    if(c.source&&c.source.project) o.title='Generado de '+c.source.project+' ('+(c.source.env||'')+')';sel.appendChild(o);});
+  const saved=store.get('fusionChecklist.cl');
+  if(saved && [...sel.options].some(o=>o.value===saved)) sel.value=saved;
+  CL=sel.value||'financials';
+  sel.onchange=()=>{ CL=sel.value; store.set('fusionChecklist.cl',CL); results={}; $('#progress').textContent=''; loadItems(); };
+}
+function fillSelect(sel, values){
+  sel.innerHTML='<option value="">Todos</option>';
+  values.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;sel.appendChild(o);});
+}
 async function loadItems(){
-  const d=await fetch('/api/checklist/items').then(r=>r.json());
+  if(!$('#fCl').options.length) await loadChecklists();
+  const d=await fetch('/api/checklist/items?cl='+encodeURIComponent(CL)).then(r=>r.json());
   ITEMS=d.items||[];
-  const mods=[...new Set(ITEMS.map(i=>i.module))];
-  mods.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;$('#fMod').appendChild(o);});
+  fillSelect($('#fMod'), [...new Set(ITEMS.map(i=>i.module))]);
+  fillSelect($('#fMethod'), [...new Set(ITEMS.map(i=>i.config_method||'UI'))]);
   try{ renderTable(); }catch(err){ showJsErr('renderTable: '+(err.stack||err.message||err)); }
   loadBUs();
 }
@@ -782,7 +802,7 @@ function renderTable(){
   const tbody=$('#tbody'); tbody.innerHTML='';
   filtered.forEach(it=>{
     const tr=document.createElement('tr');
-    const envCells=ENVS.map(env=>{
+    const envCells=!it.has_sql?ENVS.map(()=>'<td class="cnt na" title="Tarea solo UI: revisar manualmente en FSM">UI</td>').join(''):ENVS.map(env=>{
       const key=it.step+'_'+env;
       const r=results[key];
       if(!r) return '<td class="cnt" data-step="'+it.step+'" data-env="'+env+'">—</td>';
@@ -791,16 +811,17 @@ function renderTable(){
     }).join('');
     const counts=ENVS.map(env=>results[it.step+'_'+env]).filter(r=>r&&!r.error).map(r=>parseInt(r.count)||0);
     let status='';
-    if(counts.length===ENVS.length){
+    if(!it.has_sql) status='<span class="zero">manual</span>';
+    else if(counts.length===ENVS.length){
       const allSame=counts.every(c=>c===counts[0]);
       if(allSame && counts[0]===0) status='<span class="zero">vacío</span>';
       else if(allSame) status='<span class="match">✓ iguales</span>';
       else status='<span class="mismatch" style="cursor:pointer" data-diffstep="'+it.step+'">⚠ diferencias</span>';
     }
     const meth=it.config_method||'';
-    const mCls=meth==='REST'?'rest':meth==='FBDI'?'fbdi':meth==='REST+FBDI'?'rest-fbdi':'ui';
+    const mCls={'REST':'rest','FBDI':'fbdi','REST+FBDI':'rest-fbdi','SQL':'sql','PERFIL':'perfil','PERFIL BU':'perfil','LOOKUP':'lookup'}[meth]||'ui';
     const methBadge='<span class="badge-method '+mCls+'">'+esc(meth||'UI')+'</span>'+(it.fbdi?'<button class="fbdi-btn" data-fbdi="'+it.step+'" title="Extraer delta entre entornos y descargar plantilla">📥 FBDI</button>':'');
-    tr.innerHTML='<td>'+it.step+'</td><td class="mod">'+esc(it.module)+'</td><td class="task">'+esc(it.task)+'</td><td>'+esc(it.responsible||'')+'</td><td>'+methBadge+'</td>'+envCells+'<td>'+status+'</td>';
+    tr.innerHTML='<td>'+it.step+'</td><td class="mod">'+esc(it.module)+'</td><td class="task" title="'+esc((it.fsm_task||'')+(it.task_list?' · '+it.task_list:''))+'">'+esc(it.task)+(it.mandatory?'<span class="mand" title="Obligatoria en el implementation project">*</span>':'')+'</td><td>'+esc(it.responsible||'')+'</td><td>'+methBadge+'</td>'+envCells+'<td>'+status+'</td>';
     tbody.appendChild(tr);
   });
   tbody.querySelectorAll('.cnt').forEach(td=>td.onclick=()=>{
@@ -826,14 +847,15 @@ function proc(sub,mini){
 async function runAll(){
   const btn=$('#runAll'); btn.disabled=true; btn.textContent='⛏️ minando…';
   const bu=getSelectedBU();
-  let done=0, total=ITEMS.length*ENVS.length;
+  const todo=ITEMS.filter(it=>it.has_sql);
+  let done=0, total=todo.length*ENVS.length;
   $('#progress').innerHTML='<span class="proc mini" style="display:inline-flex"><span class="mc"></span><span class="msg">Procesando <span id="progTxt">0/'+total+'</span> · '+procMsg()+'</span></span>';
   results={};
-  for(const it of ITEMS){
+  const runItem=async it=>{
     const promises=ENVS.map(async env=>{
       try{
         const r=await fetch('/api/checklist/run',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({step:it.step,env,mode:'count',bu})});
+          body:JSON.stringify({cl:CL,step:it.step,env,mode:'count',bu})});
         const d=await r.json();
         results[it.step+'_'+env]=d;
       }catch(e){ results[it.step+'_'+env]={error:''+e,count:null}; }
@@ -841,24 +863,26 @@ async function runAll(){
       renderTable();
     });
     await Promise.all(promises);
-  }
+  };
+  let next=0;
+  await Promise.all(Array.from({length:Math.min(4,todo.length)},async()=>{ while(next<todo.length) await runItem(todo[next++]); }));
   btn.disabled=false; btn.textContent='▶ Ejecutar comparación';
   $('#progress').innerHTML='✓ completado 🟩✨';
 }
 
 async function exportXlsx(){
-  const btn=$('#exportXlsx'), steps=filteredItems().map(i=>i.step), bu=getSelectedBU();
+  const btn=$('#exportXlsx'), steps=filteredItems().filter(i=>i.has_sql).map(i=>i.step), bu=getSelectedBU();
   if(!steps.length){ $('#progress').textContent='⚠ No hay tareas visibles que exportar'; return; }
   btn.disabled=true; btn.textContent='⛏️ exportando…';
   $('#progress').innerHTML=proc('Consultando '+steps.length+' tareas × '+ENVS.length+' entornos para el Excel…',true);
   try{
     const r=await fetch('/api/checklist/export',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({steps,bu})});
+      body:JSON.stringify({cl:CL,steps,bu})});
     if(!r.ok) throw new Error('HTTP '+r.status);
     if((r.headers.get('Content-Type')||'').indexOf('json')>=0){ const j=await r.json(); throw new Error(j.error||'Error'); }
     const blob=await r.blob();
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
-    a.download='Fusion_Checklist'+(bu?'_BU'+bu:'')+'.xlsx'; document.body.appendChild(a); a.click();
+    a.download='Fusion_Checklist_'+($('#fCl').selectedOptions[0]||{}).textContent.replace(/ \(\d+\)$/,'').replace(/\W+/g,'_')+(bu?'_BU'+bu:'')+'.xlsx'; document.body.appendChild(a); a.click();
     a.remove(); URL.revokeObjectURL(a.href);
     $('#progress').textContent='✓ Excel generado';
   }catch(e){ $('#progress').textContent='⚠ Error al exportar: '+e.message; }
@@ -875,7 +899,7 @@ async function showDetail(step, env){
   $('#detailModal').classList.add('open');
   try{
     const r=await fetch('/api/checklist/run',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({step,env,mode:'detail',bu})});
+      body:JSON.stringify({cl:CL,step,env,mode:'detail',bu})});
     const d=await r.json();
     if(d.error){ $('#detBody').innerHTML='<div style="padding:20px;color:var(--err)">'+esc(d.error)+'</div>'; return; }
     $('#detInfo').textContent=(d.rows||[]).length+' registros';
@@ -899,7 +923,7 @@ async function showDiff(step){
   await Promise.all(ENVS.map(async env=>{
     try{
       const r=await fetch('/api/checklist/run',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({step,env,mode:'detail',bu})});
+        body:JSON.stringify({cl:CL,step,env,mode:'detail',bu})});
       allData[env]=await r.json();
     }catch(e){ allData[env]={error:''+e}; }
   }));
@@ -1107,9 +1131,36 @@ checkAuth();
 CHECKLIST_DS = "FSCM (Financials/SCM)"
 
 
+def _resource_dir():
+    # En el ejecutable PyInstaller los datos van dentro de sys._MEIPASS
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
+def load_checklists():
+    """Financials (checklist.py) + cada checklists/*.json generado con tools/fsm_checklist.py."""
+    out = {"financials": {"name": "Financials", "items": ckl.CHECKLIST, "fbdi": True}}
+    for f in sorted((_resource_dir() / "checklists").glob("*.json")):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            out[f.stem] = {"name": d.get("name") or f.stem, "items": d["items"], "fbdi": False,
+                           "source": d.get("source") or {}}
+        except Exception as e:
+            print(f"⚠ checklist {f.name} ignorado: {e}")
+    return out
+
+
+CHECKLISTS = load_checklists()
+
+
+def checklist_items(cl):
+    return (CHECKLISTS.get(cl or "financials") or CHECKLISTS["financials"])["items"]
+
+
 def checklist_query(c, item, env, mode, bu_id=None):
     """Ejecuta la SQL de conteo o detalle de un item en un entorno → (cols, rows)."""
     sql = item["detail_sql"] if mode == "detail" else item["count_sql"]
+    if not sql:
+        raise RuntimeError("Tarea solo UI: sin SQL de comprobación.")
     base, user, pw = creds(c, env)
     if not base:
         raise RuntimeError(f"Entorno '{env}' sin URL")
@@ -1280,10 +1331,17 @@ class H(BaseHTTPRequestHandler):
             prof["slug"] = profiles.slugify(slug)
             return self._send(200, json.dumps(prof))
 
+        if u.path == "/api/checklist/list":
+            return self._send(200, json.dumps({"checklists": [
+                {"id": k, "name": v["name"], "count": len(v["items"]), "source": v.get("source") or {}}
+                for k, v in CHECKLISTS.items()]}))
+
         if u.path == "/api/checklist/items":
+            cl = (parse_qs(u.query).get("cl") or ["financials"])[0]
+            fbdi_ok = (CHECKLISTS.get(cl) or CHECKLISTS["financials"])["fbdi"]
             items = []
-            for it in ckl.CHECKLIST:
-                spec = fbdi_spec_for_step(it["step"])
+            for it in checklist_items(cl):
+                spec = fbdi_spec_for_step(it["step"]) if fbdi_ok else None
                 method = it.get("config_method", "")
                 has_spec = spec is not None and (("FBDI" in method) or ("REST" in method))
                 has_rest = has_spec and bool(fbdi_rest_objects(spec))
@@ -1292,7 +1350,9 @@ class H(BaseHTTPRequestHandler):
                               "responsible": it["responsible"],
                               "config_method": method,
                               "fbdi": has_spec, "fbdi_bi": has_bi, "fbdi_rest": has_rest,
-                              "rest_resource": it.get("rest_resource")})
+                              "rest_resource": it.get("rest_resource"),
+                              "has_sql": bool(it.get("count_sql")), "mandatory": bool(it.get("mandatory")),
+                              "fsm_task": it.get("fsm_task", ""), "task_list": it.get("task_list", "")})
             return self._send(200, json.dumps({"items": items}))
 
         return self._send(404, json.dumps({"error": "not found"}))
@@ -1377,9 +1437,11 @@ class H(BaseHTTPRequestHandler):
                 step = req.get("step")
                 mode = req.get("mode", "count")
                 bu_id = req.get("bu")
-                item = next((it for it in ckl.CHECKLIST if it["step"] == step), None)
+                item = next((it for it in checklist_items(req.get("cl")) if it["step"] == step), None)
                 if not item:
                     return self._send(400, json.dumps({"error": f"Step {step} not found"}))
+                if not item.get("count_sql"):
+                    return self._send(200, json.dumps({"count": None, "na": True, "env": env, "step": step}))
                 cols, rows = checklist_query(cfg(), item, env, mode, bu_id)
                 if mode == "count":
                     cnt = rows[0].get(cols[0], "0") if rows else "0"
@@ -1397,13 +1459,15 @@ class H(BaseHTTPRequestHandler):
                 req = json.loads(self.rfile.read(n) or b"{}")
                 bu_id = req.get("bu") or None
                 steps = req.get("steps")
-                items = [it for it in ckl.CHECKLIST if not steps or it["step"] in steps]
+                items = [it for it in checklist_items(req.get("cl"))
+                         if it.get("count_sql") and (not steps or it["step"] in steps)]
                 if not items:
                     return self._send(200, json.dumps({"error": "No hay tareas que exportar."}))
                 envs = compare_envs()
                 data = checklist_collect(cfg(), items, envs, bu_id)
                 raw = checklist_build_xlsx(items, envs, data, bu_id)
-                fname = "Fusion_Checklist" + (f"_BU{bu_id}" if bu_id else "") + ".xlsx"
+                cl_name = (CHECKLISTS.get(req.get("cl") or "financials") or {}).get("name", "")
+                fname = ("Fusion_Checklist_" + re.sub(r"\W+", "_", cl_name)).rstrip("_") + (f"_BU{bu_id}" if bu_id else "") + ".xlsx"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 self.send_header("Content-Disposition", f'attachment; filename="{fname}"')

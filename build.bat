@@ -5,6 +5,6 @@ REM fbip.py junto a este script, es el paquete fusion-client. De paso entra
 REM openpyxl, que la lista suelta se dejaba fuera aunque app.py lo usa.
 pip install -r requirements.txt
 REM --collect-all fusion_client: es un paquete instalado, no un modulo suelto.
-pyinstaller --onefile --name FusionChecklist --paths . --collect-all fusion_client --collect-all openpyxl --hidden-import checklist --hidden-import profiles --collect-all keyring --clean --noconfirm app.py
+pyinstaller --onefile --name FusionChecklist --paths . --collect-all fusion_client --collect-all openpyxl --hidden-import checklist --hidden-import profiles --collect-all keyring --add-data "checklists:checklists" --clean --noconfirm app.py
 echo.
 echo Done -^> dist\FusionChecklist.exe

@@ -21,6 +21,32 @@ Después, el comparador ejecuta los 39 items del checklist (GL, AP, AR, FA, CM, 
 Intercompany) contra las instancias marcadas, con vista de detalle, diferencias, filtro por BU,
 export a Excel y delta FBDI/REST entre dos instancias.
 
+## Checklists
+
+En la barra de filtros se elige el checklist a comparar:
+
+| Checklist | Origen | Tareas |
+|---|---|---|
+| **Financials** | `checklist.py` (GL, AP, AR, FA, CM, Compras, Intercompany) | 39 |
+| **Service** | `checklists/service.json`, generado del implementation project `IMPLEMENTATION_PROJECT_1` (TEST) | 198 |
+
+Los checklists de `checklists/*.json` se generan desde un implementation project de FSM:
+
+```bash
+python3 tools/fsm_checklist.py --project IMPLEMENTATION_PROJECT_1 --client <cliente> --env TEST \
+    --name Service --out checklists/service.json --validate
+```
+
+El generador recorre las listas/tareas del proyecto y asigna a cada tarea su SQL de comprobación:
+
+- **PERFIL** — profile options que gestiona la tarea según FSM (clave = `perfil [nivel] = valor`, así un valor distinto cuenta como diferencia)
+- **LOOKUP** — lookup types de la tarea (`tipo.código (enabled)`)
+- **PERFIL BU** — profiles por Business Unit de Service (`SVC_BU_PROFILE_VALUES`)
+- **SQL** — consulta específica para objetos con tabla propia (tabla `MANUAL` del generador)
+- **UI** — sin datos consultables (credenciales, IA, IDCS…): aparecen como revisión *manual*
+
+`--validate` ejecuta cada conteo y pasa a UI las SQL que fallen en la instancia.
+
 ## Arranque
 
 ```bash

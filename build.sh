@@ -17,7 +17,7 @@ python3 -m venv .buildvenv
 # una función y el análisis estático de PyInstaller no lo ve.
 .buildvenv/bin/pyinstaller --onefile --name FusionChecklist \
   --paths . --collect-all fusion_client --collect-all openpyxl \
-  --hidden-import checklist --hidden-import profiles --collect-all keyring \
+  --hidden-import checklist --hidden-import profiles --collect-all keyring --add-data "checklists:checklists" \
   --clean --noconfirm app.py
 
 echo
